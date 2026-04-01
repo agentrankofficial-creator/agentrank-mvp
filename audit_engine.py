@@ -51,6 +51,7 @@ class AgentRankAuditor:
             'revenue_impact': {},
             'recommendations': [],
         }
+        self.shopify_products = []  # Store products.json data for fallback methods
 
     def _normalize_url(self, url):
         url = url.strip().rstrip('/')
@@ -195,6 +196,65 @@ class AgentRankAuditor:
                 except:
                     pass
 
+        # FALLBACK: If no products found (cloud IP blocked), try Shopify products.json API directly
+        if len(product_pages) == 0:
+            print("   No products found via scraping. Attempting Shopify products.json fallback...")
+            for limit in [30, 10]:  # Try with different limits
+                try:
+                    resp = self.session.get(f"{self.store_url}/products.json?limit={limit}", timeout=self.timeout)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        products = data.get('products', [])
+                        if products:
+                            # Successfully got products.json
+                            self.shopify_products = products  # Store for access in other methods
+                            self.results['platform'] = 'Shopify'
+                            self.results['product_count'] = len(products)
+                            print(f"   Found {len(products)} products via products.json API (bot-proof fallback)")
+
+                            # For cloud servers, we'll use the JSON data directly in the check methods
+                            # Fetch first 5 product pages if possible, but don't fail if blocked
+                            for p in products[:5]:
+                                handle = p.get('handle', '')
+                                if handle:
+                                    product_url = f"{self.store_url}/products/{handle}"
+                                    try:
+                                        page_resp = self.session.get(product_url, timeout=self.timeout)
+                                        if page_resp.status_code == 200:
+                                            page_soup = BeautifulSoup(page_resp.text, 'lxml')
+                                            product_pages.append({
+                                                'url': product_url,
+                                                'soup': page_soup,
+                                                'html': page_resp.text,
+                                                'api_data': p,
+                                                'title': p.get('title', ''),
+                                            })
+                                            print(f"   Fetched: {p.get('title', handle)[:50]}")
+                                            time.sleep(0.5)
+                                        else:
+                                            # Page blocked, but we have JSON data
+                                            product_pages.append({
+                                                'url': product_url,
+                                                'soup': BeautifulSoup('', 'lxml'),  # Empty soup
+                                                'html': '',
+                                                'api_data': p,
+                                                'title': p.get('title', handle),
+                                            })
+                                            print(f"   Using JSON data for: {p.get('title', handle)[:50]} (page blocked)")
+                                    except:
+                                        # Fallback: use JSON data even if page fetch fails
+                                        product_pages.append({
+                                            'url': product_url,
+                                            'soup': BeautifulSoup('', 'lxml'),
+                                            'html': '',
+                                            'api_data': p,
+                                            'title': p.get('title', handle),
+                                        })
+                            if product_pages:
+                                return product_pages
+                except:
+                    pass
+
         return product_pages
 
     def _extract_jsonld(self, soup):
@@ -238,6 +298,7 @@ class AgentRankAuditor:
         for page in product_pages:
             jsonld = self._extract_jsonld(page['soup'])
             page_html = page['html'].lower()
+            api_data = page.get('api_data', {}) or {}
 
             # Check JSON-LD
             for block in jsonld:
@@ -263,6 +324,18 @@ class AgentRankAuditor:
             if has_product < total:
                 if 'itemtype="http://schema.org/product"' in page_html or 'itemtype="https://schema.org/product"' in page_html:
                     has_product += 1
+
+            # FALLBACK: If no schema found but we have Shopify API data, credit for having structured data
+            if not jsonld and page_html == '' and api_data:
+                # This product came from products.json fallback with blocked HTML page
+                # Shopify API data is structured, so give partial credit
+                has_product += 1
+                if api_data.get('variants'):
+                    has_offer += 1
+                if api_data.get('images'):
+                    has_image += 1
+                if api_data.get('vendor'):
+                    has_brand += 1
 
         check['details'] = {
             'pages_analyzed': total,
@@ -372,6 +445,24 @@ class AgentRankAuditor:
                     if meta and meta.get('content'):
                         attr_found = True
 
+                # FALLBACK: Check additional Shopify API fields when HTML is blocked
+                if not attr_found and api_data and html == '':
+                    extended_map = {
+                        'sku': ['variants'],  # Check if variants exist
+                        'weight': 'weight',
+                        'color': 'tags',  # Sometimes color is in tags
+                        'size': 'tags',
+                        'availability': 'variants',  # Variants imply availability data
+                    }
+                    if attr in extended_map:
+                        field = extended_map[attr]
+                        if isinstance(field, list):
+                            val = api_data.get(field[0])
+                        else:
+                            val = api_data.get(field)
+                        if val:
+                            attr_found = True
+
                 if attr_found:
                     found += 1
 
@@ -425,6 +516,8 @@ class AgentRankAuditor:
 
         for page in product_pages:
             found = False
+            api_data = page.get('api_data', {}) or {}
+
             # Check JSON-LD
             jsonld = self._extract_jsonld(page['soup'])
             for block in jsonld:
@@ -436,9 +529,9 @@ class AgentRankAuditor:
                             found = True
                             break
 
-            # Check Shopify API
-            if not found and page.get('api_data'):
-                variants = page['api_data'].get('variants', [])
+            # Check Shopify API variants for barcode (GTIN/UPC storage location in Shopify)
+            if not found and api_data:
+                variants = api_data.get('variants', [])
                 for v in variants:
                     if v.get('barcode') and str(v['barcode']).strip():
                         found = True
