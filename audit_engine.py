@@ -105,7 +105,7 @@ class AgentRankAuditor:
         try:
             resp = self.session.get(self.store_url, timeout=self.timeout)
             resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, 'lxml')
+            soup = BeautifulSoup(resp.text, 'html.parser')
 
             # Detect platform
             html = resp.text.lower()
@@ -131,38 +131,63 @@ class AgentRankAuditor:
         """Find product page URLs. For Shopify, use /products.json API."""
         product_pages = []
 
-        # Try Shopify products.json API first
-        if self.results['platform'] == 'Shopify':
-            try:
-                resp = self.session.get(f"{self.store_url}/products.json?limit=10", timeout=self.timeout)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    products = data.get('products', [])
+        # Try Shopify products.json API first (always try - works even when pages are blocked)
+        try:
+            # Use clean headers for JSON API (Sec-Fetch headers can trigger challenge pages)
+            api_headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'application/json',
+            }
+            resp = requests.get(f"{self.store_url}/products.json?limit=30", headers=api_headers, timeout=self.timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                products = data.get('products', [])
+                if products:
+                    self.results['platform'] = 'Shopify'
                     self.results['product_count'] = len(products)
-                    print(f"   Found {len(products)} products via Shopify API")
+                    self.shopify_products = products
+                    print(f"   Found {len(products)} products via Shopify products.json API")
 
-                    # Fetch first 5 product pages for detailed analysis
+                    # Try to fetch first 5 product pages, fall back to JSON data if blocked
                     for p in products[:5]:
                         handle = p.get('handle', '')
                         if handle:
                             product_url = f"{self.store_url}/products/{handle}"
                             try:
                                 page_resp = self.session.get(product_url, timeout=self.timeout)
-                                page_soup = BeautifulSoup(page_resp.text, 'lxml')
+                                if page_resp.status_code == 200 and len(page_resp.text) > 500:
+                                    page_soup = BeautifulSoup(page_resp.text, 'html.parser')
+                                    product_pages.append({
+                                        'url': product_url,
+                                        'soup': page_soup,
+                                        'html': page_resp.text,
+                                        'api_data': p,
+                                        'title': p.get('title', ''),
+                                    })
+                                    print(f"   Fetched: {p.get('title', handle)[:50]}")
+                                else:
+                                    # Page blocked — use JSON data directly
+                                    product_pages.append({
+                                        'url': product_url,
+                                        'soup': BeautifulSoup('', 'html.parser'),
+                                        'html': '',
+                                        'api_data': p,
+                                        'title': p.get('title', handle),
+                                    })
+                                    print(f"   Using JSON data for: {p.get('title', handle)[:50]} (page blocked)")
+                                time.sleep(0.3)
+                            except:
                                 product_pages.append({
                                     'url': product_url,
-                                    'soup': page_soup,
-                                    'html': page_resp.text,
+                                    'soup': BeautifulSoup('', 'html.parser'),
+                                    'html': '',
                                     'api_data': p,
-                                    'title': p.get('title', ''),
+                                    'title': p.get('title', handle),
                                 })
-                                print(f"   Fetched: {p.get('title', handle)[:50]}")
-                                time.sleep(0.5)  # Be polite
-                            except:
-                                pass
-                    return product_pages
-            except:
-                pass
+                    if product_pages:
+                        return product_pages
+        except Exception as e:
+            print(f"   products.json API not available: {e}")
 
         # Fallback: scrape product links from homepage
         if homepage_data['soup']:
@@ -182,7 +207,7 @@ class AgentRankAuditor:
             for url in list(product_urls)[:5]:
                 try:
                     resp = self.session.get(url, timeout=self.timeout)
-                    soup = BeautifulSoup(resp.text, 'lxml')
+                    soup = BeautifulSoup(resp.text, 'html.parser')
                     title_tag = soup.find('title')
                     product_pages.append({
                         'url': url,
@@ -201,7 +226,8 @@ class AgentRankAuditor:
             print("   No products found via scraping. Attempting Shopify products.json fallback...")
             for limit in [30, 10]:  # Try with different limits
                 try:
-                    resp = self.session.get(f"{self.store_url}/products.json?limit={limit}", timeout=self.timeout)
+                    api_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', 'Accept': 'application/json'}
+                    resp = requests.get(f"{self.store_url}/products.json?limit={limit}", headers=api_headers, timeout=self.timeout)
                     if resp.status_code == 200:
                         data = resp.json()
                         products = data.get('products', [])
@@ -221,7 +247,7 @@ class AgentRankAuditor:
                                     try:
                                         page_resp = self.session.get(product_url, timeout=self.timeout)
                                         if page_resp.status_code == 200:
-                                            page_soup = BeautifulSoup(page_resp.text, 'lxml')
+                                            page_soup = BeautifulSoup(page_resp.text, 'html.parser')
                                             product_pages.append({
                                                 'url': product_url,
                                                 'soup': page_soup,
@@ -235,7 +261,7 @@ class AgentRankAuditor:
                                             # Page blocked, but we have JSON data
                                             product_pages.append({
                                                 'url': product_url,
-                                                'soup': BeautifulSoup('', 'lxml'),  # Empty soup
+                                                'soup': BeautifulSoup('', 'html.parser'),  # Empty soup
                                                 'html': '',
                                                 'api_data': p,
                                                 'title': p.get('title', handle),
@@ -245,7 +271,7 @@ class AgentRankAuditor:
                                         # Fallback: use JSON data even if page fetch fails
                                         product_pages.append({
                                             'url': product_url,
-                                            'soup': BeautifulSoup('', 'lxml'),
+                                            'soup': BeautifulSoup('', 'html.parser'),
                                             'html': '',
                                             'api_data': p,
                                             'title': p.get('title', handle),
@@ -325,9 +351,9 @@ class AgentRankAuditor:
                 if 'itemtype="http://schema.org/product"' in page_html or 'itemtype="https://schema.org/product"' in page_html:
                     has_product += 1
 
-            # FALLBACK: If no schema found but we have Shopify API data, credit for having structured data
-            if not jsonld and page_html == '' and api_data:
-                # This product came from products.json fallback with blocked HTML page
+            # FALLBACK: If no JSON-LD schema found on this page but we have Shopify API data
+            page_found_schema = any('Product' in str(b.get('@type', '')) for b in jsonld)
+            if not page_found_schema and api_data:
                 # Shopify API data is structured, so give partial credit
                 has_product += 1
                 if api_data.get('variants'):
@@ -639,7 +665,7 @@ class AgentRankAuditor:
             desc = ''
             api_data = page.get('api_data', {}) or {}
             if api_data.get('body_html'):
-                desc_soup = BeautifulSoup(api_data['body_html'], 'lxml')
+                desc_soup = BeautifulSoup(api_data['body_html'], 'html.parser')
                 desc = desc_soup.get_text(strip=True)
             else:
                 # Try meta description
